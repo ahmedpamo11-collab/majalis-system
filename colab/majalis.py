@@ -5,15 +5,14 @@
 بيشتغل على Google Colab (أو على اللابتوب كاحتياطي)، على فولدر «مجالس» في درايف أحمد:
 
   مجالس/
-    الوارد/          ← أحمد بيرمي هنا ملفات «كاميرا مجالس» (من تطبيق Drive)
+    الوارد/          ← أحمد بيرمي هنا فولدرات «كاميرا مجالس» (TAF-012_1/ فيها الفيديو والصوت والكود)،
+                       أو الملفات نفسها، أو أي فيديو عادي
     الدروس/
       TAF-012/       ← فولدر لكل درس
         TAF-012_1.mp4            الملف الأصلي (ما بيتلمسش أبداً، بيتنقل بس)
-        TAF-012_1.m4a            صوت الفيديو (نسخة من غير إعادة ضغط)
-        TAF-012_1.backup.m4a     الصوت الاحتياطي (لو موجود)
-        TAF-012_1.timeline.jsonl التوقيتات
-        TAF-012_1.meta.json      بيانات التسجيل
-        TAF-012_1.log.txt        سجل التطبيق
+        TAF-012_1.m4a            الصوت (من الموبايل، أو بيتطلّع من الفيديو من غير إعادة ضغط)
+        TAF-012_1.json           الكود: بيانات التسجيل + كل الدوسات بتوقيتها + سجل التطبيق
+        TAF-012_1.backup.m4a     الصوت الاحتياطي (لو موجود جوه الفيديو)
         TAF-012_1.480p.mp4       نسخة صغيرة للمشاهدة والتصحيح
         lesson.json              بطاقة الدرس (بتتعدّل من الموقع)
       يدوي/<اسم الملف>/       ← فيديوهات عادية من غير بيانات (زي اللي اتصوّرت بكاميرا الموبايل)
@@ -136,6 +135,16 @@ def probe(path):
     }
 
 
+def load_code(ldir, base):
+    """ملف الكود (TAF-012_1.json): {"meta":…, "timeline":[…], "log":"…"}."""
+    return read_json(os.path.join(ldir, base + '.json'))
+
+
+def load_events(ldir, base):
+    c = load_code(ldir, base)
+    return (c or {}).get('timeline') or []
+
+
 def timeline_events(raw):
     evs = []
     for line in raw.decode('utf-8', 'replace').splitlines():
@@ -196,13 +205,15 @@ def process_recording(ldir, fname):
     base = fname[:-4]
     info = {'file': fname, 'bytes': os.path.getsize(src)}
     tr = read_trailer(src)
+    code_path = os.path.join(ldir, base + '.json')
     if tr:
         info['trailer'] = True
         info['videoBytes'] = tr['_start']
-        for kind, ext in (('TMLN', '.timeline.jsonl'), ('META', '.meta.json'), ('LOGS', '.log.txt')):
-            out = os.path.join(ldir, base + ext)
-            if kind in tr and not os.path.exists(out):
-                write_bytes(out, tr[kind])
+        # الكود: لو ملف الـ json ماوصلش جنب الفيديو، نطلّعه من النسخة اللي جوه الفيديو
+        if not os.path.exists(code_path) and ('META' in tr or 'TMLN' in tr):
+            meta = json.loads(tr.get('META', b'{}') or b'{}')
+            evs = timeline_events(tr.get('TMLN', b''))
+            write_json(code_path, {'majalis': 1, 'meta': meta, 'timeline': evs, 'log': tr.get('LOGS', b'').decode('utf-8', 'replace'), 'from': 'inside-video'})
         bk = os.path.join(ldir, base + '.backup.m4a')
         if 'AUDI' in tr and len(tr['AUDI']) > 1000 and not os.path.exists(bk):
             aac = os.path.join(ldir, base + '.backup.aac.tmp')
@@ -212,6 +223,7 @@ def process_recording(ldir, fname):
         info['backupAudio'] = os.path.exists(bk)
     else:
         info['trailer'] = False
+    info['code'] = os.path.exists(code_path)
 
     pr = probe(src)
     if not pr:
@@ -267,7 +279,7 @@ def update_card(ldir, code, recs):
     card['durMs'] = sum(r.get('durMs', 0) for r in recs if r.get('ok'))
     card['problems'] = [r['file'] + ': ' + r['problem'] for r in recs if r.get('problem')]
     # من بيانات أول تسجيل: الشيخ، والتاريخ، ومكان البداية
-    meta = read_json(os.path.join(ldir, recs[0]['file'][:-4] + '.meta.json'), {}) if recs else {}
+    meta = ((load_code(ldir, recs[0]['file'][:-4]) or {}).get('meta') or {}) if recs else {}
     inf = (meta or {}).get('info', {}) or {}
     if meta and 'startedWall' in meta and 'date' not in card:
         d = datetime.datetime.fromtimestamp(meta['startedWall'] / 1000)
@@ -283,9 +295,9 @@ def update_card(ldir, code, recs):
     # من التوقيتات: أول وآخر آية/حديث في الدرس
     keys = []
     for r in recs:
-        tl = os.path.join(ldir, r['file'][:-4] + '.timeline.jsonl')
-        if os.path.exists(tl):
-            segs = segments(timeline_events(open(tl, 'rb').read()), book, r.get('durMs') or 0)
+        evs = load_events(ldir, r['file'][:-4])
+        if evs:
+            segs = segments(evs, book, r.get('durMs') or 0)
             keys += [s for s in segs if s['to'] - s['from'] >= 1]
     if keys:
         card['range'] = {'from': keys[0]['key'], 'to': keys[-1]['key'], 'count': len({s['key'] for s in keys})}
@@ -309,42 +321,59 @@ def lesson_dir_for(fname):
     return code, p(LESSONS, code)
 
 
+VIDEO_EXT = ('.mp4', '.mov', '.m4v', '.mkv')
+
+
 def receive_inbox():
-    files = sorted(f for f in os.listdir(p(INBOX)) if f.lower().endswith(('.mp4', '.mov', '.m4v', '.mkv')) and not f.startswith('.'))
-    if not files:
+    """كل فيديو في «الوارد» (أو في فولدر جواه)، ومعاه ملفاته (نفس الاسم: ‎.json و‎.m4a)، بيتنقل لفولدر الدرس."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(p(INBOX)):
+        for f in sorted(filenames):
+            if f.lower().endswith(VIDEO_EXT) and not f.startswith('.') and not f.endswith('.480p.mp4'):
+                found.append((dirpath, f))
+    if not found:
         say('«الوارد» فاضي.')
     touched = set()
-    for f in files:
-        src = p(INBOX, f)
+    for dirpath, f in found:
+        src = os.path.join(dirpath, f)
         # ملف لسه بيترفع؟ نستنى لما حجمه يثبت
         s1 = os.path.getsize(src); time.sleep(2); s2 = os.path.getsize(src)
         if s1 != s2:
             say('⏳ %s لسه بيترفع — هيتاخد المرة الجاية' % f)
             continue
+        stem = os.path.splitext(f)[0]
         code, ldir = lesson_dir_for(f)
         if not code:
-            if not read_trailer(src):
+            tr = read_trailer(src)
+            fn = json.loads(tr.get('META', b'{}') or b'{}').get('file') if tr else None
+            code, ldir = lesson_dir_for(fn) if fn else (None, None)
+            if not code:
                 # فيديو عادي (من كاميرا الموبايل مثلاً): فولدر لوحده لحد ما يتعمله بيانات من الموقع
-                ldir = p(LESSONS, MANUAL, os.path.splitext(f)[0])
-                code = MANUAL + '/' + os.path.splitext(f)[0]
-            else:
-                tr = read_trailer(src)
-                meta = json.loads(tr.get('META', b'{}') or b'{}')
-                fn = meta.get('file') or f
-                code, ldir = lesson_dir_for(fn)
-                if not code:
-                    ldir = p(LESSONS, MANUAL, os.path.splitext(f)[0]); code = MANUAL + '/' + os.path.splitext(f)[0]
+                ldir = p(LESSONS, MANUAL, stem); code = MANUAL + '/' + stem
         os.makedirs(ldir, exist_ok=True)
+        sibs = [x for x in os.listdir(dirpath) if x != f and x.startswith(stem + '.') and not x.lower().endswith(VIDEO_EXT)]
         dst = os.path.join(ldir, f)
         if os.path.exists(dst):
             if os.path.getsize(dst) == os.path.getsize(src):
                 say('↺ %s موجود قبل كده في %s — اتساب في «الوارد» زي ما هو' % (f, code))
                 continue
-            stem, ext = os.path.splitext(f)
-            dst = os.path.join(ldir, stem + '.dup-' + time.strftime('%Y%m%d%H%M%S') + ext)
+            stem2 = stem + '.dup-' + time.strftime('%Y%m%d%H%M%S')
+            dst = os.path.join(ldir, stem2 + os.path.splitext(f)[1])
+            sibs_dst = {x: os.path.join(ldir, stem2 + x[len(stem):]) for x in sibs}
+        else:
+            sibs_dst = {x: os.path.join(ldir, x) for x in sibs}
         shutil.move(src, dst)               # نقل بس — الأصل ما بيتغيّرش
-        say('📥 %s ← %s' % (f, code))
+        for x, xd in sibs_dst.items():
+            if not os.path.exists(xd):
+                shutil.move(os.path.join(dirpath, x), xd)
+        say('📥 %s%s ← %s' % (f, (' + ' + '، '.join(sorted(s[len(stem):] for s in sibs))) if sibs else '', code))
         touched.add(ldir)
+        # فولدر التسجيل في «الوارد» فضي؟ نشيله (لو فيه أي حاجة تانية بيفضل زي ما هو)
+        if os.path.normpath(dirpath) != os.path.normpath(p(INBOX)):
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
     return touched
 
 
@@ -403,10 +432,10 @@ def rebuild_indexes():
         if book not in verses:
             continue
         for r in card.get('recordings', []):
-            tl = os.path.join(ldir, r['file'][:-4] + '.timeline.jsonl')
-            if not (r.get('ok') and os.path.exists(tl)):
+            evs = load_events(ldir, r['file'][:-4]) if r.get('ok') else []
+            if not evs:
                 continue
-            for s in segments(timeline_events(open(tl, 'rb').read()), book, r.get('durMs') or 0):
+            for s in segments(evs, book, r.get('durMs') or 0):
                 if s['to'] - s['from'] < 1:
                     continue
                 e = {'lesson': card['code'], 'file': r['file'], 'from': s['from'], 'to': s['to']}
